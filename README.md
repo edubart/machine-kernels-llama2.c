@@ -1,3 +1,20 @@
+# Machine Kernels LLama-2
+
+This is a small experiment made during Cartesi Experiment Week 2 with the goal of
+doing Llama 2 7B inference in a reasonable amount of time inside the Cartesi Machine,
+while being deterministic.
+
+This repository depends and runs only with a special Cartesi Machine
+[emulator branch](https://github.com/cartesi/machine-emulator/tree/feature/accelerated-kernels) with added support for accelerated kernels.
+
+To this all matrix multiplication operations are offloaded for the host CPU
+to execute while the RISC-V machine can also run a RISC-V kernel capable
+of running the same matrix multiplication when doing proofs.
+
+# Original README
+
+Bellow is the original README.
+
 ## llama2.c
 
 <p align="center">
