@@ -1,0 +1,13 @@
+llama-2-7b
+runq
+run
+runq_rv64
+run_rv64
+*.so
+*.bak
+*.bin
+*.elf
+*.sqfs
+*.pt
+*.txt
+*.dump

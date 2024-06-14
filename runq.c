@@ -14,6 +14,78 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+// ----------------------------------------------------------------------------
+// Matmul kernel memory allocator
+
+#define MMAP_ADDR 0x100000000UL
+#define MMAP_LENGTH (9*1024*1024*1024UL) // 9GB
+static uint64_t shared_memory_offset = 0;
+
+void init_kallocator() {
+    // The base address is set to match the same physical address outside the machine
+    // Sadly Linux doesn't make physical memory of the pages adjacent and contiguous
+    // relative to each other/ in the first virtual memory mapping.
+    // But if we mmap() twice it will be contiguous,
+    // this is a trick very dependent on the Linux kernel.
+    const int prot = PROT_READ | PROT_WRITE;
+    int flags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE;
+#ifdef __riscv
+#ifndef MAP_HUGE_1GB
+#define MAP_HUGE_1GB    (30 << MAP_HUGE_SHIFT)
+#endif
+    flags |= MAP_HUGETLB | MAP_HUGE_1GB;
+#endif
+    void *ptr = mmap((void*)MMAP_ADDR, MMAP_LENGTH, prot, MAP_FIXED_NOREPLACE | flags, -1, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "mmap failed for shared memory\n");
+        exit(EXIT_FAILURE);
+    }
+    // The second mmap() should make pages contiguous relative to each other
+    ptr = mmap((void*)MMAP_ADDR, MMAP_LENGTH, prot, MAP_FIXED | flags, -1, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "mmap failed for shared memory\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void *kcalloc(uint64_t n, uint64_t chunk_len) {
+    unsigned char* data = (unsigned char*)(MMAP_ADDR);
+    uint64_t offset = ((shared_memory_offset + 0xfUL) & (~0xfUL)); // align forward to 16 bytes
+    uint64_t len = n * chunk_len;
+    if (len == 0) {
+        return NULL;
+    }
+    uint64_t next_offset = offset + len;
+    if (next_offset > MMAP_LENGTH) {
+        fprintf(stderr, "out of shared memory\n");
+        exit(EXIT_FAILURE);
+    }
+    if (shared_memory_offset == 0) {
+        // Initialize on the first allocation
+        init_kallocator();
+    }
+    shared_memory_offset = next_offset;
+    return (unsigned char*)(MMAP_ADDR + offset);
+}
+
+void kfree(void *ptr) {
+    // ignore for now
+}
+
+#ifdef __riscv
+__attribute__((noinline,naked))
+void softyield(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+  asm volatile ("sraiw x0, x30, 0\n\tret");
+}
+#define RUN_KERNEL(name, a0, a1, a2, a3, a4, a5, a6, a7) \
+    softyield((uint64_t)a0, (uint64_t)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4, (uint64_t)a5, (uint64_t)a6, (uint64_t)a7)
+#else
+#define RUN_KERNEL(name, a0, a1, a2, a3, a4, a5, a6, a7) \
+    extern void kernel_entry(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t); \
+    kernel_entry((uint64_t)a0, (uint64_t)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4, (uint64_t)a5, (uint64_t)a6, (uint64_t)a7)
+#endif
+
 // ----------------------------------------------------------------------------
 // Globals
 int GS = 0; // group size global for quantization of the weights
@@ -91,20 +163,20 @@ typedef struct {
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->xq = (QuantizedTensor) { .q = calloc(p->dim, sizeof(int8_t)), .s = calloc(p->dim, sizeof(float)) };
-    s->hq = (QuantizedTensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim, sizeof(float)) };
-    s->q = calloc(p->dim, sizeof(float));
-    s->k = calloc(kv_dim, sizeof(float));
-    s->v = calloc(kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->x = kcalloc(p->dim, sizeof(float));
+    s->xb = kcalloc(p->dim, sizeof(float));
+    s->xb2 = kcalloc(p->dim, sizeof(float));
+    s->hb = kcalloc(p->hidden_dim, sizeof(float));
+    s->hb2 = kcalloc(p->hidden_dim, sizeof(float));
+    s->xq = (QuantizedTensor) { .q = kcalloc(p->dim, sizeof(int8_t)), .s = kcalloc(p->dim, sizeof(float)) };
+    s->hq = (QuantizedTensor) { .q = kcalloc(p->hidden_dim, sizeof(int8_t)), .s = kcalloc(p->hidden_dim, sizeof(float)) };
+    s->q = kcalloc(p->dim, sizeof(float));
+    s->k = kcalloc(kv_dim, sizeof(float));
+    s->v = kcalloc(kv_dim, sizeof(float));
+    s->att = kcalloc(p->n_heads * p->seq_len, sizeof(float));
+    s->logits = kcalloc(p->vocab_size, sizeof(float));
+    s->key_cache = kcalloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->value_cache = kcalloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
@@ -115,22 +187,22 @@ void malloc_run_state(RunState* s, Config* p) {
 }
 
 void free_run_state(RunState* s) {
-    free(s->x);
-    free(s->xb);
-    free(s->xb2);
-    free(s->hb);
-    free(s->hb2);
-    free(s->xq.q);
-    free(s->xq.s);
-    free(s->hq.q);
-    free(s->hq.s);
-    free(s->q);
-    free(s->k);
-    free(s->v);
-    free(s->att);
-    free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
+    kfree(s->x);
+    kfree(s->xb);
+    kfree(s->xb2);
+    kfree(s->hb);
+    kfree(s->hb2);
+    kfree(s->xq.q);
+    kfree(s->xq.s);
+    kfree(s->hq.q);
+    kfree(s->hq.s);
+    kfree(s->q);
+    kfree(s->k);
+    kfree(s->v);
+    kfree(s->att);
+    kfree(s->logits);
+    kfree(s->key_cache);
+    kfree(s->value_cache);
 }
 
 // ----------------------------------------------------------------------------
@@ -240,12 +312,13 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
-    fclose(file);
     // memory map the Transformer weights into the data pointer
-    *fd = open(checkpoint, O_RDONLY); // open in read only mode
-    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    fseek(file, 0, SEEK_SET);
+    *data = (float*)kcalloc(*file_size, 1);
+    int nitems = (*file_size + 4095) / 4096;
+    if (fread(*data, 4096, nitems, file) != nitems) { exit(EXIT_FAILURE); }
+    *fd = -1;
+    fclose(file);
     void* weights_ptr = ((char*)*data) + header_size; // skip header bytes. char is 1 byte
     memory_map_weights(weights, config, weights_ptr, shared_classifier);
 }
@@ -270,7 +343,7 @@ void free_transformer(Transformer* t) {
     free(t->weights.w3);
     if(t->weights.wcls != t->weights.q_tokens) { free(t->weights.wcls); }
     // close the memory mapping
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
+    kfree(t->data);
     if (t->fd != -1) { close(t->fd); }
     // free the RunState buffers
     free_run_state(&t->state);
@@ -318,27 +391,7 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
-
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-
-        float val = 0.0f;
-        int32_t ival = 0;
-        int in = i * n;
-
-        // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
-            for (int k = 0; k < GS; k++) {
-                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
-            }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
-        }
-
-        xout[i] = val;
-    }
+    RUN_KERNEL(matmul_kernel, xout, x->q, x->s, w->q, w->s, n, d, GS);
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
@@ -1023,6 +1076,7 @@ void error_usage() {
 }
 
 int main(int argc, char *argv[]) {
+    printf("Loading model...\n");
 
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
@@ -1073,6 +1127,7 @@ int main(int argc, char *argv[]) {
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
+    printf("Model loaded, running...\n");
     // run!
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
